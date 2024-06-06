@@ -2,33 +2,55 @@ package me.videogamesm12.rgitgrab;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import joptsimple.OptionParser;
+import joptsimple.OptionSet;
 import me.videogamesm12.rgitgrab.data.RBXBranch;
+import me.videogamesm12.rgitgrab.data.RBXVersion;
 import org.apache.commons.io.FileUtils;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ResetCommand;
 import org.eclipse.jgit.api.errors.GitAPIException;
-import org.eclipse.jgit.lib.AnyObjectId;
+import org.eclipse.jgit.revwalk.RevCommit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 public class Main
 {
     private static final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private static final Logger logger = LoggerFactory.getLogger("RGitGrab");
+    private static final DateFormat responseDateFormat = new SimpleDateFormat("'['EEE',' dd MMM yyyy HH':'mm':'ss zzz']'");
+    private static final HttpClient httpClient = HttpClient.newHttpClient();
 
     public static void main(String[] args) throws GitAPIException
     {
+        // Read the parameters
+        final OptionParser parser = new OptionParser();
+        parser.accepts("s", "Prioritizes speed when retrieving client hashes over accuracy.");
+        parser.accepts("j", "Dump the results into a neatly-organized JSON file.");
+        final OptionSet options = parser.parse(args);
+
+        boolean speed = options.has("s");
+        boolean json = options.has("j");
+
         // Set up our working directory
         final File folder = new File("temp");
         if (folder.exists() && folder.isDirectory())
@@ -52,22 +74,22 @@ public class Main
                 .call();
 
         final Map<String, RBXBranch> branches = new HashMap<>();
-        final List<String> commits = StreamSupport.stream(git.log().call().spliterator(), false)/*.sorted(Comparator.comparingInt(RevCommit::getCommitTime))*/.map(AnyObjectId::getName).toList();
+        final List<RevCommit> commits = StreamSupport.stream(git.log().call().spliterator(), false).toList();
         final Pattern pattern = Pattern.compile("([A-z0-9]+): (version-[A-z0-9]+) \\[([0-9.]+)]");
         final AtomicInteger unique = new AtomicInteger();
 
         logger.info("Now it's time to get funky");
         commits.forEach(commit ->
         {
-            logger.info("Reading commit {}", commit);
+            logger.info("Reading commit {}", commit.getName());
 
             try
             {
-                git.reset().setMode(ResetCommand.ResetType.HARD).setRef(commit).call();
+                git.reset().setMode(ResetCommand.ResetType.HARD).setRef(commit.getName()).call();
             }
             catch (GitAPIException ex)
             {
-                logger.error("Failed to revert repository to commit {}", commit, ex);
+                logger.error("Failed to revert repository to commit {}", commit.getName(), ex);
                 return;
             }
 
@@ -98,7 +120,7 @@ public class Main
                         }
 
                         // Determine what type of client this line is
-                        final List<String> type = switch (matcher.group(1).toLowerCase())
+                        final List<RBXVersion> type = switch (matcher.group(1).toLowerCase())
                         {
                             case "windowsplayer" -> branch.getWindowsPlayer();
                             case "windowsstudio" -> branch.getWindowsStudio();
@@ -111,13 +133,23 @@ public class Main
                             default -> throw new RuntimeException("Unknown client type " + matcher.group(1).toLowerCase());
                         };
 
-                        if (!type.contains(matcher.group(2)))
+                        if (type.stream().noneMatch(version -> version.equals(matcher.group(2))))
                         {
                             logger.info("Adding new version {} of type {}", matcher.group(2), matcher.group(1));
-                            type.add(matcher.group(2));
+                            String[] version = matcher.group(3).split("\\.");
+                            type.add(new RBXVersion(matcher.group(2), RBXVersion.Type.findType(matcher.group(1).toLowerCase()),
+                                    fetchVersionDate(branchName, matcher.group(2), commit, !speed), version[0], version[1], version[2], version[3]));
                             unique.incrementAndGet();
                         }
                     }
+                }
+                catch (InterruptedException ex)
+                {
+                    logger.error("Unable to read timestamp response from server", ex);
+                }
+                catch (ParseException ex)
+                {
+                    logger.error("Unable to parse timestamp response from server", ex);
                 }
                 catch (IOException ex)
                 {
@@ -128,7 +160,7 @@ public class Main
 
         logger.info("Found {} unique clients in {} branches", unique.get(), branches.size());
 
-        dumpResults(branches, true);
+        dumpResults(branches, !json);
 
         logger.info("Cleaning up");
         try
@@ -160,8 +192,8 @@ public class Main
                 {
                     // Standard
                     final StringBuilder mac = new StringBuilder();
-                    branch.getMacStudio().forEach(studio -> mac.append(String.format("New Studio %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", studio)));
-                    branch.getMacPlayer().forEach(player -> mac.append(String.format("New Client %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", player)));
+                    Stream.of(branch.getMacStudio(), branch.getMacPlayer()).flatMap(Collection::stream)
+                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> mac.append(client.toDeployString()));
 
                     try
                     {
@@ -177,7 +209,8 @@ public class Main
                 if (!branch.getMacStudioCJV().isEmpty())
                 {
                     final StringBuilder macCJV = new StringBuilder();
-                    branch.getMacStudioCJV().forEach(studio -> macCJV.append(String.format("New Studio %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", studio)));
+                    Stream.of(branch.getMacStudioCJV()).flatMap(Collection::stream)
+                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> macCJV.append(client.toDeployString()));
 
                     try
                     {
@@ -191,26 +224,28 @@ public class Main
 
                 //-- Windows --//
                 // Standard
-                final StringBuilder win = new StringBuilder();
-                branch.getWindowsStudio().forEach(studio -> win.append(String.format("New Studio %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", studio)));
-                branch.getWindowsStudio64().forEach(studio -> win.append(String.format("New Studio64 %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", studio)));
-                branch.getWindowsPlayer().forEach(player -> win.append(String.format("New WindowsPlayer %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", player)));
+                if (!branch.getWindowsStudio().isEmpty() || !branch.getWindowsStudio64().isEmpty() || !branch.getWindowsPlayer().isEmpty())
+                {
+                    final StringBuilder win = new StringBuilder();
+                    Stream.of(branch.getWindowsStudio(), branch.getWindowsStudio64(), branch.getWindowsPlayer()).flatMap(Collection::stream)
+                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> win.append(client.toDeployString()));
 
-                try
-                {
-                    FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".txt"), win.toString(), Charset.defaultCharset());
-                }
-                catch (IOException ex)
-                {
-                    logger.error("Failed to write DeployHistory-formatted file on branch {}", name, ex);
+                    try
+                    {
+                        FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".txt"), win.toString(), Charset.defaultCharset());
+                    }
+                    catch (IOException ex)
+                    {
+                        logger.error("Failed to write DeployHistory-formatted file on branch {}", name, ex);
+                    }
                 }
 
                 // CJV
                 if (!branch.getWindowsStudioCJV().isEmpty() || !branch.getWindowsStudio64CJV().isEmpty())
                 {
                     final StringBuilder winCJV = new StringBuilder();
-                    branch.getWindowsStudioCJV().forEach(studio -> winCJV.append(String.format("New Studio %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", studio)));
-                    branch.getWindowsStudio64CJV().forEach(studio -> winCJV.append(String.format("New Studio64 %s at 4/20/2069 12:00:00 AM, file version: 0, 0, 0, 0....Done!\n", studio)));
+                    Stream.of(branch.getWindowsStudioCJV(), branch.getWindowsStudio64CJV()).flatMap(Collection::stream)
+                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> winCJV.append(client.toDeployString()));
 
                     try
                     {
@@ -237,5 +272,26 @@ public class Main
                 logger.debug(branches.toString());
             }
         }
+    }
+
+    public static long fetchVersionDate(String channel, String hash, RevCommit commit, boolean pullOnline) throws ParseException, IOException, InterruptedException
+    {
+        // If pullOnline is set to true, then we use the much more accurate but incredibly slow method of retrieving the
+        //  date using the Roblox setup bucket
+        if (pullOnline)
+        {
+            final HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
+                    .uri(URI.create("https://s3.amazonaws.com/setup.roblox.com/" +
+                            (!channel.equalsIgnoreCase( "live") ? "channel/" + channel + "/" : "")
+                            + hash + "-RobloxVersion.txt"))
+                    .build(), HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 403)
+            {
+                return responseDateFormat.parse(response.headers().map().get("Last-Modified").toString()).getTime();
+            }
+        }
+
+        return commit.getCommitTime() * 1000L;
     }
 }
