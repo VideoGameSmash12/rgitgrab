@@ -74,7 +74,7 @@ public class Main
                 .call();
 
         final Map<String, RBXBranch> branches = new HashMap<>();
-        final List<RevCommit> commits = StreamSupport.stream(git.log().call().spliterator(), false).toList();
+        final List<RevCommit> commits = StreamSupport.stream(git.log().call().spliterator(), false).sorted(Comparator.comparingInt(RevCommit::getCommitTime)).toList();
         final Pattern pattern = Pattern.compile("([A-z0-9]+): (version-[A-z0-9]+) \\[([0-9.]+)]");
         final AtomicInteger unique = new AtomicInteger();
 
