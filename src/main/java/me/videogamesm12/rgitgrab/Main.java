@@ -2,10 +2,14 @@ package me.videogamesm12.rgitgrab;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
+import lombok.Getter;
 import me.videogamesm12.rgitgrab.data.RBXBranch;
 import me.videogamesm12.rgitgrab.data.RBXVersion;
+import me.videogamesm12.rgitgrab.data.RGGConfiguration;
 import org.apache.commons.io.FileUtils;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ResetCommand;
@@ -26,7 +30,10 @@ import java.nio.file.Files;
 import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -38,18 +45,15 @@ public class Main
     private static final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private static final Logger logger = LoggerFactory.getLogger("RGitGrab");
     private static final DateFormat responseDateFormat = new SimpleDateFormat("'['EEE',' dd MMM yyyy HH':'mm':'ss zzz']'");
+    @Getter
     private static final HttpClient httpClient = HttpClient.newHttpClient();
+
+    private static RGGConfiguration configuration = null;
 
     public static void main(String[] args) throws GitAPIException
     {
         // Read the parameters
-        final OptionParser parser = new OptionParser();
-        parser.accepts("s", "Prioritizes speed when retrieving client hashes over accuracy.");
-        parser.accepts("j", "Dump the results into a neatly-organized JSON file.");
-        final OptionSet options = parser.parse(args);
-
-        boolean speed = options.has("s");
-        boolean json = options.has("j");
+        configuration = RGGConfiguration.getFromParameters(args);
 
         // Set up our working directory
         final File folder = new File("temp");
@@ -138,7 +142,7 @@ public class Main
                             logger.info("Adding new version {} of type {}", matcher.group(2), matcher.group(1));
                             String[] version = matcher.group(3).split("\\.");
                             type.add(new RBXVersion(matcher.group(2), RBXVersion.Type.findType(matcher.group(1).toLowerCase()),
-                                    fetchVersionDate(branchName, matcher.group(2), commit, !speed), version[0], version[1], version[2], version[3]));
+                                    fetchVersionDate(branchName, matcher.group(2), commit, !configuration.isSpeed()), version[0], version[1], version[2], version[3]));
                             unique.incrementAndGet();
                         }
                     }
@@ -160,7 +164,7 @@ public class Main
 
         logger.info("Found {} unique clients in {} branches", unique.get(), branches.size());
 
-        dumpResults(branches, !json);
+        dumpResults(branches);
 
         logger.info("Cleaning up");
         try
@@ -176,100 +180,277 @@ public class Main
         logger.info("Done!");
     }
 
-    private static void dumpResults(Map<String, RBXBranch> branches, boolean deployFormat)
+    private static void dumpResults(Map<String, RBXBranch> branches)
     {
-        logger.info("Dumping results to disk");
-
-        if (deployFormat)
+        switch (configuration.getDestination())
         {
-            final File file = new File("deploys");
-            file.mkdirs();
-
-            branches.forEach((name, branch) ->
+            case ARIA2C ->
             {
-                //-- Mac --//
-                if (!branch.getMacStudio().isEmpty() || !branch.getMacPlayer().isEmpty())
+                final ThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(4);
+                final ThreadPoolExecutor sender = new ScheduledThreadPoolExecutor(8);
+                final Pattern filePattern = Pattern.compile("^([A-z0-9-]+\\.[A-z0-9]+)");
+                branches.forEach((name, branch) ->
                 {
-                    // Standard
-                    final StringBuilder mac = new StringBuilder();
-                    Stream.of(branch.getMacStudio(), branch.getMacPlayer()).flatMap(Collection::stream)
-                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> mac.append(client.toDeployString()));
+                    executor.execute(() ->
+                    {
+                        // TODO: This could be executed better but it'll be fine for now
+                        branch.getStandardWindowsVersions().forEach(client ->
+                        {
+                            final List<String> files = new ArrayList<>();
 
-                    try
-                    {
-                        FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".mac.txt"), mac.toString(), Charset.defaultCharset());
-                    }
-                    catch (IOException ex)
-                    {
-                        logger.error("Failed to write DeployHistory-formatted file for Mac on branch {}", name, ex);
-                    }
-                }
+                            logger.info("Preparing to send version {}", client.getHash());
+                            try
+                            {
+                                final HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
+                                        .uri(URI.create("https://s3.amazonaws.com/setup.roblox.com/" +
+                                                (!name.equalsIgnoreCase( "live") ? "channel/" + name + "/" : "")
+                                                + client.getHash() + "-rbxPkgManifest.txt"))
+                                        .build(), HttpResponse.BodyHandlers.ofString());
 
-                // CJV
-                if (!branch.getMacStudioCJV().isEmpty())
-                {
-                    final StringBuilder macCJV = new StringBuilder();
-                    Stream.of(branch.getMacStudioCJV()).flatMap(Collection::stream)
-                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> macCJV.append(client.toDeployString()));
+                                Arrays.stream(response.body().split("\r\n")).forEach(line ->
+                                {
+                                    if (filePattern.matcher(line).find())
+                                    {
+                                        files.add(client.getHash() + "-" + line);
+                                    }
+                                });
+                            }
+                            catch (InterruptedException ex)
+                            {
+                                return;
+                            }
+                            catch (IOException ex)
+                            {
+                                logger.error("An error occurred while attempting to get the manifest for version {}", client.getHash(), ex);
+                                return;
+                            }
 
-                    try
-                    {
-                        FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".mac.cjv.txt"), macCJV.toString(), Charset.defaultCharset());
-                    }
-                    catch (IOException ex)
-                    {
-                        logger.error("Failed to write DeployHistory-formatted file for Mac CJV on branch {}", name, ex);
-                    }
-                }
+                            logger.info("Queuing files for version {}", client.getHash());
+                            files.forEach(url ->
+                            {
+                                sender.submit(() ->
+                                {
+                                    try
+                                    {
+                                        httpClient.send(createRequestForFile(name, client,"", url), HttpResponse.BodyHandlers.ofString());
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        logger.error("Failed to send request to aria2c instance", ex);
+                                    }
+                                });
+                            });
+                        });
 
-                //-- Windows --//
-                // Standard
-                if (!branch.getWindowsStudio().isEmpty() || !branch.getWindowsStudio64().isEmpty() || !branch.getWindowsPlayer().isEmpty())
-                {
-                    final StringBuilder win = new StringBuilder();
-                    Stream.of(branch.getWindowsStudio(), branch.getWindowsStudio64(), branch.getWindowsPlayer()).flatMap(Collection::stream)
-                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> win.append(client.toDeployString()));
+                        branch.getCJVWindowsVersions().forEach(client ->
+                        {
+                            final List<String> files = new ArrayList<>();
 
-                    try
-                    {
-                        FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".txt"), win.toString(), Charset.defaultCharset());
-                    }
-                    catch (IOException ex)
-                    {
-                        logger.error("Failed to write DeployHistory-formatted file on branch {}", name, ex);
-                    }
-                }
+                            logger.info("Preparing to send version {}", client.getHash());
+                            try
+                            {
+                                final HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
+                                        .uri(URI.create("https://s3.amazonaws.com/setup.roblox.com/" +
+                                                (!name.equalsIgnoreCase( "live") ? "channel/" + name + "/" : "")
+                                                + "cjv/" + client.getHash() + "-rbxPkgManifest.txt"))
+                                        .build(), HttpResponse.BodyHandlers.ofString());
 
-                // CJV
-                if (!branch.getWindowsStudioCJV().isEmpty() || !branch.getWindowsStudio64CJV().isEmpty())
-                {
-                    final StringBuilder winCJV = new StringBuilder();
-                    Stream.of(branch.getWindowsStudioCJV(), branch.getWindowsStudio64CJV()).flatMap(Collection::stream)
-                            .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> winCJV.append(client.toDeployString()));
+                                Arrays.stream(response.body().split("\r\n")).forEach(line ->
+                                {
+                                    if (filePattern.matcher(line).find())
+                                    {
+                                        files.add(client.getHash() + "-" + line);
+                                    }
+                                });
+                            }
+                            catch (InterruptedException ex)
+                            {
+                                return;
+                            }
+                            catch (IOException ex)
+                            {
+                                logger.error("An error occurred while attempting to get the manifest for version {}", client.getHash(), ex);
+                                return;
+                            }
 
-                    try
-                    {
-                        FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".cjv.txt"), winCJV.toString(), Charset.defaultCharset());
-                    }
-                    catch (IOException ex)
-                    {
-                        logger.error("Failed to write DeployHistory-formatted file for CJV on branch {}", name, ex);
-                    }
-                }
-            });
-        }
-        else
-        {
-            try
-            {
-                BufferedWriter writer = Files.newBufferedWriter(new File("versions.json").toPath());
-                gson.toJson(branches, writer);
-                writer.close();
+                            logger.info("Queuing files for version {}", client.getHash());
+                            files.forEach(url ->
+                            {
+                                sender.submit(() ->
+                                {
+                                    try
+                                    {
+                                        httpClient.send(createRequestForFile(name, client, "cjv/", url), HttpResponse.BodyHandlers.ofString());
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        logger.error("Failed to send request to aria2c instance", ex);
+                                    }
+                                });
+                            });
+                        });
+
+                        branch.getStandardMacVersions().forEach(client ->
+                        {
+                            final List<String> files = new ArrayList<>();
+
+                            logger.info("Preparing to send version {}", client.getHash());
+                            if (client.getType() == RBXVersion.Type.MAC_PLAYER)
+                            {
+                                files.add(client.getHash() + "-Roblox.dmg");
+                                files.add(client.getHash() + "-RobloxPlayer.zip");
+                            }
+                            else
+                            {
+                                files.add(client.getHash() + "-RobloxStudioApp.zip");
+                                files.add(client.getHash() + "-RobloxStudio.zip");
+                                files.add(client.getHash() + "-RobloxStudio.dmg");
+                            }
+
+                            logger.info("Queuing files for version {}", client.getHash());
+                            files.forEach(url ->
+                            {
+                                sender.submit(() ->
+                                {
+                                    try
+                                    {
+                                        httpClient.send(createRequestForFile(name, client, "mac/", url), HttpResponse.BodyHandlers.ofString());
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        logger.error("Failed to send request to aria2c instance", ex);
+                                    }
+                                });
+                            });
+                        });
+
+                        branch.getCJVMacVersions().forEach(client ->
+                        {
+                            final List<String> files = new ArrayList<>();
+
+                            logger.info("Preparing to send version {}", client.getHash());
+                            if (client.getType() == RBXVersion.Type.MAC_PLAYER)
+                            {
+                                files.add(client.getHash() + "-Roblox.dmg");
+                                files.add(client.getHash() + "-RobloxPlayer.zip");
+                            }
+                            else
+                            {
+                                files.add(client.getHash() + "-RobloxStudioApp.zip");
+                                files.add(client.getHash() + "-RobloxStudio.zip");
+                                files.add(client.getHash() + "-RobloxStudio.dmg");
+                            }
+
+                            logger.info("Queuing files for version {}", client.getHash());
+                            files.forEach(url ->
+                            {
+                                sender.submit(() ->
+                                {
+                                    try
+                                    {
+                                        httpClient.send(createRequestForFile(name, client, "mac/cjv/", url), HttpResponse.BodyHandlers.ofString());
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        logger.error("Failed to send request to aria2c instance", ex);
+                                    }
+                                });
+                            });
+                        });
+                    });
+                });
             }
-            catch (Exception ex)
+            case DEPLOY_HISTORY ->
             {
-                logger.error("Failed to dump branch data to disk", ex);
-                logger.debug(branches.toString());
+                final File file = new File("deploys");
+                file.mkdirs();
+
+                branches.forEach((name, branch) ->
+                {
+                    //-- Mac --//
+                    if (!branch.getMacStudio().isEmpty() || !branch.getMacPlayer().isEmpty())
+                    {
+                        // Standard
+                        final StringBuilder mac = new StringBuilder();
+                        Stream.of(branch.getMacStudio(), branch.getMacPlayer()).flatMap(Collection::stream)
+                                .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> mac.append(client.toDeployString()));
+
+                        try
+                        {
+                            FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".mac.txt"), mac.toString(), Charset.defaultCharset());
+                        }
+                        catch (IOException ex)
+                        {
+                            logger.error("Failed to write DeployHistory-formatted file for Mac on branch {}", name, ex);
+                        }
+                    }
+
+                    // CJV
+                    if (!branch.getMacStudioCJV().isEmpty())
+                    {
+                        final StringBuilder macCJV = new StringBuilder();
+                        Stream.of(branch.getMacStudioCJV()).flatMap(Collection::stream)
+                                .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> macCJV.append(client.toDeployString()));
+
+                        try
+                        {
+                            FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".mac.cjv.txt"), macCJV.toString(), Charset.defaultCharset());
+                        }
+                        catch (IOException ex)
+                        {
+                            logger.error("Failed to write DeployHistory-formatted file for Mac CJV on branch {}", name, ex);
+                        }
+                    }
+
+                    //-- Windows --//
+                    // Standard
+                    if (!branch.getWindowsStudio().isEmpty() || !branch.getWindowsStudio64().isEmpty() || !branch.getWindowsPlayer().isEmpty())
+                    {
+                        final StringBuilder win = new StringBuilder();
+                        Stream.of(branch.getWindowsStudio(), branch.getWindowsStudio64(), branch.getWindowsPlayer()).flatMap(Collection::stream)
+                                .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> win.append(client.toDeployString()));
+
+                        try
+                        {
+                            FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".txt"), win.toString(), Charset.defaultCharset());
+                        }
+                        catch (IOException ex)
+                        {
+                            logger.error("Failed to write DeployHistory-formatted file on branch {}", name, ex);
+                        }
+                    }
+
+                    // CJV
+                    if (!branch.getWindowsStudioCJV().isEmpty() || !branch.getWindowsStudio64CJV().isEmpty())
+                    {
+                        final StringBuilder winCJV = new StringBuilder();
+                        Stream.of(branch.getWindowsStudioCJV(), branch.getWindowsStudio64CJV()).flatMap(Collection::stream)
+                                .sorted(Comparator.comparingLong(RBXVersion::getDate)).forEach(client -> winCJV.append(client.toDeployString()));
+
+                        try
+                        {
+                            FileUtils.writeStringToFile(new File(file, "DeployHistory." + name + ".cjv.txt"), winCJV.toString(), Charset.defaultCharset());
+                        }
+                        catch (IOException ex)
+                        {
+                            logger.error("Failed to write DeployHistory-formatted file for CJV on branch {}", name, ex);
+                        }
+                    }
+                });
+            }
+            case JSON ->
+            {
+                try
+                {
+                    BufferedWriter writer = Files.newBufferedWriter(new File("versions.json").toPath());
+                    gson.toJson(branches, writer);
+                    writer.close();
+                }
+                catch (Exception ex)
+                {
+                    logger.error("Failed to dump branch data to disk", ex);
+                    logger.debug(branches.toString());
+                }
             }
         }
     }
@@ -293,5 +474,33 @@ public class Main
         }
 
         return commit.getCommitTime() * 1000L;
+    }
+
+    public static HttpRequest createRequestForFile(String channel, RBXVersion version, String suffix, String file)
+    {
+        // Create an aria2c request
+        final JsonObject object = new JsonObject();
+        object.addProperty("jsonrpc", "2.0");
+        object.addProperty("method", "aria2.addUri");
+
+        final JsonArray params = new JsonArray();
+        params.add("token:");
+        final JsonArray link = new JsonArray();
+        link.add("https://s3.amazonaws.com/setup.roblox.com/" +
+                (!channel.equalsIgnoreCase("live") ? "channel/" + channel + "/" : "")
+                + suffix + file);
+        params.add(link);
+        final JsonObject output = new JsonObject();
+        output.addProperty("out", (!channel.equalsIgnoreCase("live") ? channel + "/" + suffix : "")
+                + version.getHash() + "/"
+                + file);
+        params.add(output);
+        object.add("params", params);
+        object.addProperty("id", Instant.now().toEpochMilli());
+
+        return HttpRequest.newBuilder()
+                .uri(URI.create("http://127.0.0.1:6800/jsonrpc"))
+                .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(object)))
+                .build();
     }
 }
